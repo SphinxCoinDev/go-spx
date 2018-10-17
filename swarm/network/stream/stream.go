@@ -66,8 +66,9 @@ type Registry struct {
 // RegistryOptions holds optional values for NewRegistry constructor.
 type RegistryOptions struct {
 	SkipCheck       bool
-	DoSync          bool
-	DoRetrieve      bool
+	DoSync          bool // Sets if the server syncs with peers. Default is true, set to false by lightnode or nosync flags.
+	DoRetrieve      bool // Sets if the server issues Retrieve requests. Default is true.
+	DoServeRetrieve bool // Sets if the server serves Retrieve requests. Default is true, set to false by lightnode flag.
 	SyncUpdateDelay time.Duration
 	MaxPeerServers  int // The limit of servers for each peer in registry
 }
@@ -93,14 +94,21 @@ func NewRegistry(localID enode.ID, delivery *Delivery, syncChunkStore storage.Sy
 	}
 	streamer.api = NewAPI(streamer)
 	delivery.getPeer = streamer.getPeer
-	streamer.RegisterServerFunc(swarmChunkServerStreamName, func(_ *Peer, _ string, _ bool) (Server, error) {
-		return NewSwarmChunkServer(delivery.chunkStore), nil
-	})
+
+	if options.DoServeRetrieve {
+		streamer.RegisterServerFunc(swarmChunkServerStreamName, func(_ *Peer, _ string, _ bool) (Server, error) {
+			return NewSwarmChunkServer(delivery.chunkStore), nil
+		})
+	}
+
 	streamer.RegisterClientFunc(swarmChunkServerStreamName, func(p *Peer, t string, live bool) (Client, error) {
 		return NewSwarmSyncerClient(p, syncChunkStore, NewStream(swarmChunkServerStreamName, t, live))
 	})
-	RegisterSwarmSyncerServer(streamer, syncChunkStore)
-	RegisterSwarmSyncerClient(streamer, syncChunkStore)
+
+	if options.DoSync {
+		RegisterSwarmSyncerServer(streamer, syncChunkStore)
+		RegisterSwarmSyncerClient(streamer, syncChunkStore)
+	}
 
 	if options.DoSync {
 		// latestIntC function ensures that
@@ -375,7 +383,7 @@ func (r *Registry) Run(p *network.BzzPeer) error {
 	defer sp.close()
 
 	if r.doRetrieve {
-		err := r.Subscribe(p.ID(), NewStream(swarmChunkServerStreamName, "", false), nil, Top)
+		err := r.Subscribe(p.ID(), NewStream(swarmChunkServerStreamName, "", true), nil, Top)
 		if err != nil {
 			return err
 		}
@@ -500,10 +508,38 @@ type server struct {
 	stream       Stream
 	priority     uint8
 	currentBatch []byte
+	sessionIndex uint64
+}
+
+// setNextBatch adjusts passed interval based on session index and whether
+// stream is live or history. It calls Server SetNextBatch with adjusted
+// interval and returns batch hashes and their interval.
+func (s *server) setNextBatch(from, to uint64) ([]byte, uint64, uint64, *HandoverProof, error) {
+	if s.stream.Live {
+		if from == 0 {
+			from = s.sessionIndex
+		}
+		if to <= from || from >= s.sessionIndex {
+			to = math.MaxUint64
+		}
+	} else {
+		if (to < from && to != 0) || from > s.sessionIndex {
+			return nil, 0, 0, nil, nil
+		}
+		if to == 0 || to > s.sessionIndex {
+			to = s.sessionIndex
+		}
+	}
+	return s.SetNextBatch(from, to)
 }
 
 // Server interface for outgoing peer Streamer
 type Server interface {
+	// SessionIndex is called when a server is initialized
+	// to get the current cursor state of the stream data.
+	// Based on this index, live and history stream intervals
+	// will be adjusted before calling SetNextBatch.
+	SessionIndex() (uint64, error)
 	SetNextBatch(uint64, uint64) (hashes []byte, from uint64, to uint64, proof *HandoverProof, err error)
 	GetData(context.Context, []byte) ([]byte, error)
 	Close()
